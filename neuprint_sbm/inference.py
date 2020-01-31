@@ -65,8 +65,9 @@ def infer_hierarchy(neuron_df, connection_df, min_weight=10, init='groundtruth',
         connection_df = connection_df.query('bodyId_pre in @bodies and bodyId_post in @bodies')
 
     if init == "groundtruth":
-        assign_type_levels(neuron_df)
-        init_bs = type_blocks(neuron_df)
+        with Timer("Computing initial hierarchy from groundtruth", logger):
+            assign_type_levels(neuron_df)
+            init_bs = type_blocks(neuron_df)
     else:
         init_bs = None
 
@@ -221,6 +222,11 @@ def type_blocks(neurons_df):
 
 
 if __name__ == "__main__":
+    lsf_slots = os.environ.get('LSB_DJOB_NUMPROC', default=0)
+    if lsf_slots:
+        os.environ['OMP_NUM_THREADS'] = lsf_slots
+        print(f"Using {lsf_slots} CPUs for OpenMP")
+    
     g, nbs, partition_df = infer_hierarchy('traced-adjacencies-2020-01-30/traced-neurons.csv',
                                            'traced-adjacencies-2020-01-30/traced-total-connections.csv',
                                            special_debug=False)
