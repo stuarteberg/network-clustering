@@ -40,17 +40,22 @@ logger = logging.getLogger(__name__)
 def load_table(df):
     if isinstance(df, str):
         ext = df[-4:]
-        assert ext in ('.csv', '.npy')
+        assert ext in ('.csv', '.npy', '.pkl')
         if ext == '.csv':
             df = pd.read_csv(df)
         elif ext =='.npy':
             df = pd.DataFrame(np.load(df, allow_pickle=True))
+        elif ext in '.pkl':
+            df = pickle.load(open(df, 'rb'))
 
     assert isinstance(df, pd.DataFrame)
     return df
     
 
 def infer_hierarchy(neuron_df, connection_df, min_weight=10, init='groundtruth', verbose=True, special_debug=False):
+    ##
+    ## TODO: If filtering connections for min_weight drops some neurons entirely, they should be removed from neuron_df
+    ##
     assert init in ('groundtruth', 'random')
     neuron_df = load_table(neuron_df)
     connection_df = load_table(connection_df)
@@ -92,7 +97,7 @@ def infer_hierarchy(neuron_df, connection_df, min_weight=10, init='groundtruth',
         nbs = graph_tool.inference.minimize_nested_blockmodel_dl(g, bs=init_bs, deg_corr=True, verbose=verbose)
 
     partition_df = construct_partition_table(nbs, neuron_df, vertexes, vertex_reverse_mapper)
-    return g, nbs, partition_df
+    return strong_connections_df, g, nbs, partition_df
 
 
 def construct_graph(weights, vertexes, vertex_mapper):
@@ -145,9 +150,10 @@ def construct_partition_table(nbs, neuron_df, vertexes, vertex_reverse_mapper):
     
     partition_df = pd.DataFrame(node_partitions, columns=range(num_levels))
     
+    ndf = neuron_df.rename(columns={'bodyId': 'body'})
     partition_df['body'] = vertex_reverse_mapper.apply(partition_df.loc[:,0].values)
-    partition_df = partition_df.merge(neuron_df['instance'], 'left', left_on='body', right_index=True)
-    partition_df = partition_df.merge(neuron_df['type'], 'left', left_on='body', right_index=True)
+    partition_df = partition_df.merge(ndf[['body', 'instance']], 'left', on='body')
+    partition_df = partition_df.merge(ndf[['body', 'type']], 'left', on='body')
     
     partition_df['instance'] = partition_df['instance'].fillna('')
     partition_df['type'] = partition_df['type'].fillna('')
@@ -227,11 +233,12 @@ if __name__ == "__main__":
         os.environ['OMP_NUM_THREADS'] = lsf_slots
         print(f"Using {lsf_slots} CPUs for OpenMP")
     
-    g, nbs, partition_df = infer_hierarchy('traced-adjacencies-2020-01-30/traced-neurons.csv',
-                                           'traced-adjacencies-2020-01-30/traced-total-connections.csv',
-                                           special_debug=False)
+    strong_connections_df, g, nbs, partition_df = infer_hierarchy('traced-adjacencies-2020-01-30/traced-neurons.csv',
+                                                                  'traced-adjacencies-2020-01-30/traced-total-connections.csv',
+                                                                  special_debug=False)
 
     os.makedirs('inferred-blocks', exist_ok=True)
     pickle.dump(g,              open('inferred-blocks/graph.pkl', 'wb'))
     pickle.dump(nbs,            open('inferred-blocks/nested-block-state.pkl', 'wb'))
     pickle.dump(partition_df,   open('inferred-blocks/partition_df.pkl', 'wb'))
+    pickle.dump(strong_connections_df,   open('inferred-blocks/strong_connections_df.pkl', 'wb'))
