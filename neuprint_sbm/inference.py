@@ -94,7 +94,11 @@ def infer_hierarchy(neuron_df, connection_df, min_weight=10, init='groundtruth',
     
     with Timer("Running inference"):
         # Computes a NestedBlockState
-        nbs = graph_tool.inference.minimize_nested_blockmodel_dl(g, bs=init_bs, deg_corr=True, verbose=verbose)
+        nbs = graph_tool.inference.minimize_nested_blockmodel_dl(g,
+                                                                 bs=init_bs,
+                                                                 mcmc_args=dict(parallel=True), # see graph-tool docs and mailing list for caveats 
+                                                                 deg_corr=True,
+                                                                 verbose=verbose)
 
     partition_df = construct_partition_table(nbs, neuron_df, vertexes, vertex_reverse_mapper)
     return strong_connections_df, g, nbs, partition_df
