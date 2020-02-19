@@ -1,41 +1,61 @@
 import os
-import re
-import zlib
 import pickle
 import logging
-import subprocess
+import argparse
 
 import numpy as np
 import pandas as pd
-from scipy.spatial import KDTree
-from matplotlib.colors import hsv_to_rgb
-
-from bokeh.plotting import figure, output_notebook, show, ColumnDataSource
-from bokeh.models import HoverTool, LabelSet, TapTool
-from bokeh.events import Tap
-#from bokeh.layouts import row, column
-import bokeh.layouts as bl
-import hvplot.pandas
 
 import graph_tool.inference
 import graph_tool as gt
 
 from dvidutils import LabelMapper
 
-from neuprint import Client
+from neuprint import Client, fetch_adjacencies, NeuronCriteria as NC
 
-from neuclease.util import Timer, tqdm_proxy
+from neuclease.util import Timer
 
 from neuclease import configure_default_logging
 configure_default_logging()
 
 
-
-#from neuclease.dvid import *
-#output_notebook()
-
 logger = logging.getLogger(__name__)
 
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--neuprint-server', '-n', default='neuprint.janelia.org')
+    parser.add_argument('--dataset', '-d')
+    parser.add_argument('--init', '-i', choices=['groundtruth', 'random'])
+    parser.add_argument('--verbose', '-v', action='store_true')
+    parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--min-weight', '-w', default=10, type=int)
+    args = parser.parse_args()
+
+    c = Client(args.neuprint_server, args.dataset)
+    export_dir = f"{c.dataset}-w{args.min_weight}-from-{args.init}"
+    os.makedirs(export_dir, exist_ok=True)
+
+    # Fetch connectome (and export)
+    with Timer("Fetching/exporting connectome", logger):
+        criteria = NC(status='Traced', cropped=False, client=c)
+        neuron_df, roi_conn_df = fetch_adjacencies(criteria, criteria, min_total_weight=args.min_weight, export_dir=export_dir, properties=['type', 'instance'], client=c)
+        conn_df = roi_conn_df.groupby(['bodyId_pre', 'bodyId_post'], as_index=False)['weight'].sum()
+    
+    strong_connections_df, g, nbs, partition_df = infer_hierarchy(neuron_df,
+                                                                  conn_df,
+                                                                  args.min_weight,
+                                                                  args.init,
+                                                                  args.verbose,
+                                                                  args.debug)
+
+    with Timer("Exporting inference results", logger):
+        pickle.dump(g,                     open(f'{export_dir}/graph.pkl', 'wb'))
+        pickle.dump(nbs,                   open(f'{export_dir}/nested-block-state.pkl', 'wb'))
+        pickle.dump(partition_df,          open(f'{export_dir}/partition_df.pkl', 'wb'))
+        pickle.dump(strong_connections_df, open(f'{export_dir}/strong_connections_df.pkl', 'wb'))
+
+    logger.info("DONE")
 
 def load_table(df):
     if isinstance(df, str):
@@ -56,6 +76,11 @@ def infer_hierarchy(neuron_df, connection_df, min_weight=10, init='groundtruth',
     ##
     ## TODO: If filtering connections for min_weight drops some neurons entirely, they should be removed from neuron_df
     ##
+    lsf_slots = os.environ.get('LSB_DJOB_NUMPROC', default=0)
+    if lsf_slots:
+        os.environ['OMP_NUM_THREADS'] = lsf_slots
+        logger.info(f"Using {lsf_slots} CPUs for OpenMP")
+
     assert init in ('groundtruth', 'random')
     neuron_df = load_table(neuron_df)
     connection_df = load_table(connection_df)
@@ -71,8 +96,9 @@ def infer_hierarchy(neuron_df, connection_df, min_weight=10, init='groundtruth',
 
     if init == "groundtruth":
         with Timer("Computing initial hierarchy from groundtruth", logger):
-            assign_type_levels(neuron_df)
-            init_bs = type_blocks(neuron_df)
+            assign_morpho_indexes(neuron_df)
+            num_morpho_groups = neuron_df.morpho_index.max()+1
+            init_bs = [neuron_df['morpho_index'].values, np.zeros(num_morpho_groups, dtype=int)]
     else:
         init_bs = None
 
@@ -171,78 +197,19 @@ def construct_partition_table(nbs, neuron_df, vertexes, vertex_reverse_mapper):
     return partition_df
 
 
-def assign_type_levels(neurons_df):
-    # Example name: ADL01oa_pct
-    nums = '[0-9]*'
-    chars = '[^0-9_]*'
-    pat = re.compile(f'_?({chars})?({nums})?(_?{chars})?(_?{chars}{nums})?(_?{chars}{nums}_?)?')
+def assign_morpho_indexes(neurons_df):
+    neurons_df['morpho_type'] = neurons_df['type'].fillna('').apply(lambda s: s.split('_')[0])
+    morpho_types = neurons_df['morpho_type'].sort_values().reset_index(drop=True)
+    morpho_types = morpho_types.loc[morpho_types != '']
 
-    def level_name(ntype, level):
-        assert level >= 1
-        if not isinstance(ntype, str):
-            return ''
-        ntype = ntype.replace('(', '_')
-        ntype = ntype.replace(')', '_')
-        if ntype.endswith('pct'):
-            ntype = ntype[:-3]
-        if ntype.endswith('_'):
-            ntype = ntype[:-1]
-        return ''.join(re.match(pat, ntype).groups()[:6-level])
-
-    for level in range(5,0,-1):
-        neurons_df[f'type_{level}'] = neurons_df['type'].apply(lambda s: level_name(s, level))
-    neurons_df.sort_values([f'type_{i}' for i in range(1,6)], inplace=True)
-
-
-def type_blocks(neurons_df):
-    neurons_df.reset_index(drop=True, inplace=True)
+    morpho_mapping = dict(zip(morpho_types, morpho_types.index))
+    morpho_mapping[''] = len(morpho_types)
+    neurons_df['morpho_index'] = neurons_df['morpho_type'].map(morpho_mapping)
     
-    t1_names = pd.unique(neurons_df['type_1'])
-    t2_names = pd.unique(neurons_df['type_2'])
-    t3_names = pd.unique(neurons_df['type_3'])
-    t4_names = pd.unique(neurons_df['type_4'])
-    t5_names = pd.unique(neurons_df['type_5'])
-
-    t1_lookup = pd.Series(index=t1_names, data=np.arange(len(t1_names)))
-    t2_lookup = pd.Series(index=t2_names, data=np.arange(len(t2_names)))
-    t3_lookup = pd.Series(index=t3_names, data=np.arange(len(t3_names)))
-    t4_lookup = pd.Series(index=t4_names, data=np.arange(len(t4_names)))
-    t5_lookup = pd.Series(index=t5_names, data=np.arange(len(t5_names)))
-    
-    neurons_df['block_1'] = 0
-    neurons_df['block_2'] = 0
-    neurons_df['block_3'] = 0
-    neurons_df['block_4'] = 0
-    neurons_df['block_5'] = 0
-
-    for row in tqdm_proxy(neurons_df.itertuples(), total=len(neurons_df)):
-        neurons_df.loc[row.Index, 'block_1'] = t1_lookup[row.type_1]
-        neurons_df.loc[row.Index, 'block_2'] = t2_lookup[row.type_2]
-        neurons_df.loc[row.Index, 'block_3'] = t3_lookup[row.type_3]
-        neurons_df.loc[row.Index, 'block_4'] = t4_lookup[row.type_4]
-        neurons_df.loc[row.Index, 'block_5'] = t5_lookup[row.type_5]
-
-    blocks = []
-    blocks.append(neurons_df['block_1'].values)
-    blocks.append(neurons_df.drop_duplicates(['block_1']).sort_values('block_1')['block_2'].values)
-    blocks.append(neurons_df.drop_duplicates(['block_2']).sort_values('block_2')['block_3'].values)
-    blocks.append(neurons_df.drop_duplicates(['block_3']).sort_values('block_3')['block_4'].values)
-    blocks.append(np.zeros((neurons_df['block_4'].nunique(),), dtype=int))
-    return blocks
+    # Everything with no morpho type at all gets a group by itself.
+    empty = (neurons_df['morpho_type'] == '')
+    neurons_df.loc[empty, 'morpho_index'] = len(morpho_types) + np.arange(empty.sum())
 
 
 if __name__ == "__main__":
-    lsf_slots = os.environ.get('LSB_DJOB_NUMPROC', default=0)
-    if lsf_slots:
-        os.environ['OMP_NUM_THREADS'] = lsf_slots
-        print(f"Using {lsf_slots} CPUs for OpenMP")
-    
-    strong_connections_df, g, nbs, partition_df = infer_hierarchy('traced-adjacencies-2020-01-30/traced-neurons.csv',
-                                                                  'traced-adjacencies-2020-01-30/traced-total-connections.csv',
-                                                                  special_debug=False)
-
-    os.makedirs('inferred-blocks', exist_ok=True)
-    pickle.dump(g,              open('inferred-blocks/graph.pkl', 'wb'))
-    pickle.dump(nbs,            open('inferred-blocks/nested-block-state.pkl', 'wb'))
-    pickle.dump(partition_df,   open('inferred-blocks/partition_df.pkl', 'wb'))
-    pickle.dump(strong_connections_df,   open('inferred-blocks/strong_connections_df.pkl', 'wb'))
+    main()
